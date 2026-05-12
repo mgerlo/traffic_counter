@@ -52,30 +52,41 @@ def insert_probe_data(conn, data):
           e vengono convertiti in float per il tipo DOUBLE PRECISION
         - conn.commit() conferma la transazione: senza di esso
           i dati non verrebbero salvati nel database
+        - In caso di errore, conn.rollback() annulla la transazione
+          per mantenere il database in uno stato consistente,
+          poi rilancia l'eccezione verso on_message
     """
-    with conn.cursor() as cur:
-        cur.execute("""
-                    INSERT INTO probe_data
-                        (pid, name, lon, lat, tm, sid, typ, fos, len, cls, spd, flg)
-                    VALUES 
-                        (%(pid)s, %(name)s, %(lon)s, %(lat)s, %(tm)s,
-                            %(sid)s, %(typ)s, %(fos)s, %(len)s, %(cls)s, %(spd)s, %(flg)s)
-                    """, {
-                        'pid': data.get('pid'),
-                        'name': data.get('name'),
-                        'lon': float(data.get('lon', 0)),
-                        'lat': float(data.get('lat', 0)),
-                        'tm': datetime.fromtimestamp(data.get('tm', 0), tz=timezone.utc),
-                        'sid': data.get('sid'),
-                        'typ': data.get('typ'),
-                        'fos': data.get('fos'),
-                        'len': data.get('len'),
-                        'cls': data.get('cls'),
-                        'spd': data.get('spd'),
-                        'flg': data.get('flg')
-                    })
-        conn.commit()
-        print(f"-> Inserito: probe={data.get('name')}, classe={data.get('cls')}, velocità={data.get('spd')} km/h")
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                        INSERT INTO probe_data
+                            (pid, name, lon, lat, tm, sid, typ, fos, len, cls, spd, flg)
+                        VALUES 
+                            (%(pid)s, %(name)s, %(lon)s, %(lat)s, %(tm)s,
+                                %(sid)s, %(typ)s, %(fos)s, %(len)s, %(cls)s, %(spd)s, %(flg)s)
+                        """, {
+                            'pid': data.get('pid'),
+                            'name': data.get('name'),
+                            'lon': float(data.get('lon', 0)),
+                            'lat': float(data.get('lat', 0)),
+                            'tm': datetime.fromtimestamp(data.get('tm', 0), tz=timezone.utc),
+                            'sid': data.get('sid'),
+                            'typ': data.get('typ'),
+                            'fos': data.get('fos'),
+                            'len': data.get('len'),
+                            'cls': data.get('cls'),
+                            'spd': data.get('spd'),
+                            'flg': data.get('flg')
+                        })
+            # Conferma la transazione: i dati vengono salvati definitivamente
+            conn.commit()
+            print(f"-> Inserito: probe={data.get('name')}, classe={data.get('cls')}, velocità={data.get('spd')} km/h")
+    except Exception as e:
+        # Annulla la transazione per mantenere il database in uno stato consistente
+        conn.rollback()
+        print(f"X Errore inserimento DB: {e}")
+        # Rilancia l'eccezione verso on_message che la cattura nel suo try/except
+        raise
 
 def on_connect(client, userdata, flags, reason_code, properties):
     """
