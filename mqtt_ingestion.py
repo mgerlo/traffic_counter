@@ -6,20 +6,20 @@ from datetime import datetime, timezone
 # Configurazione MQTT
 # Parametri di connessione al broker MQTT remoto della telecamera
 
-MQTT_HOST = "159.69.51.171"  # Indirizzo IP del broker MQTT
-MQTT_PORT = 1883  # Porta standard MQTT
-MQTT_USER = "terso"  # Username di autenticazione
+MQTT_HOST = "159.69.51.171"     # Indirizzo IP del broker MQTT
+MQTT_PORT = 1883                # Porta standard MQTT
+MQTT_USER = "terso"             # Username di autenticazione
 MQTT_PASS = "2OU5GZSB04ocdsjNDTxsK"  # Password di autenticazione
 MQTT_TOPIC = "/Floud/AutoCounter/48b02dea1de6/count"  # Topic da cui ricevere i dati
 
 # Configurazione Database
 # Parametri di connessione al database PostgreSQL/TimescaleDB locale
 
-DB_HOST = "localhost"  # Il database gira in locale tramite Docker
-DB_PORT = 5433  # Porta mappata dal container Docker (5433 -> 5432)
-DB_NAME = "trafficdb"  # Nome del database dedicato al progetto
-DB_USER = "postgres"  # Utente PostgreSQL di default
-DB_PASS = "password"  # Password impostata alla creazione del container
+DB_HOST = "localhost"   # Il database gira in locale tramite Docker
+DB_PORT = 5433          # Porta mappata dal container Docker (5433 -> 5432)
+DB_NAME = "trafficdb"   # Nome del database dedicato al progetto
+DB_USER = "postgres"    # Utente PostgreSQL di default
+DB_PASS = "password"    # Password impostata alla creazione del container
 
 def get_db_connection():
     """
@@ -36,6 +36,47 @@ def get_db_connection():
         password=DB_PASS
     )
 
+def upsert_probe(conn, data):
+    """
+    Inserisce o aggiorna l'anagrafica di una probe nella tabella probes.
+
+    Parametri:
+        conn  -- la connessione attiva al database
+        data  -- il dizionario Python ottenuto dal JSON del messaggio MQTT
+
+    Note:
+        - Usa INSERT ... ON CONFLICT DO UPDATE (upsert) per gestire
+          sia il primo inserimento che eventuali aggiornamenti futuri
+          dei dati anagrafici (nome, coordinate) senza generare errori
+        - Viene chiamata ad ogni messaggio ricevuto, ma aggiorna
+          il database solo se i dati sono effettivamente cambiati
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO probes (pid, sid, name, lon, lat)
+                VALUES (%(pid)s, %(sid)s, %(name)s, %(lon)s, %(lat)s)
+                ON CONFLICT (pid) DO UPDATE SET
+                    sid  = EXCLUDED.sid,
+                    name = EXCLUDED.name,
+                    lon  = EXCLUDED.lon,
+                    lat  = EXCLUDED.lat
+            """, {
+                'pid':  data.get('pid'),
+                'sid':  data.get('sid'),
+                'name': data.get('name'),
+                'lon':  float(data.get('lon', 0)),
+                'lat':  float(data.get('lat', 0))
+            })
+            # Conferma la transazione
+            conn.commit()
+
+    except Exception as e:
+        # Annulla la transazione per mantenere il database in uno stato consistente
+        conn.rollback()
+        print(f"X Errore aggiornamento anagrafica probe: {e}")
+        raise
+
 def insert_probe_data(conn, data):
     """
     Inserisce una singola riga nella tabella probe_data della Hypertable.
@@ -48,10 +89,8 @@ def insert_probe_data(conn, data):
         - Il timestamp 'tm' arriva come Unix timestamp (secondi dal 1970)
           e viene convertito in un oggetto datetime con fuso orario UTC
           prima dell'inserimento, come richiesto dal tipo TIMESTAMPTZ
-        - lon e lat arrivano come stringhe nel JSON ('11.226857')
-          e vengono convertiti in float per il tipo DOUBLE PRECISION
-        - conn.commit() conferma la transazione: senza di esso
-          i dati non verrebbero salvati nel database
+        - Contiene solo i dati di transito del veicolo, senza i campi
+          anagrafici (name, lon, lat, sid) ora spostati in probes
         - In caso di errore, conn.rollback() annulla la transazione
           per mantenere il database in uno stato consistente,
           poi rilancia l'eccezione verso on_message
@@ -60,17 +99,13 @@ def insert_probe_data(conn, data):
         with conn.cursor() as cur:
             cur.execute("""
                         INSERT INTO probe_data
-                            (pid, name, lon, lat, tm, sid, typ, fos, len, cls, spd, flg)
+                            (pid, tm, typ, fos, len, cls, spd, flg)
                         VALUES 
-                            (%(pid)s, %(name)s, %(lon)s, %(lat)s, %(tm)s,
-                                %(sid)s, %(typ)s, %(fos)s, %(len)s, %(cls)s, %(spd)s, %(flg)s)
+                            (%(pid)s, %(tm)s, %(typ)s, %(fos)s, 
+                             %(len)s, %(cls)s, %(spd)s, %(flg)s)
                         """, {
                             'pid': data.get('pid'),
-                            'name': data.get('name'),
-                            'lon': float(data.get('lon', 0)),
-                            'lat': float(data.get('lat', 0)),
                             'tm': datetime.fromtimestamp(data.get('tm', 0), tz=timezone.utc),
-                            'sid': data.get('sid'),
                             'typ': data.get('typ'),
                             'fos': data.get('fos'),
                             'len': data.get('len'),
@@ -119,13 +154,18 @@ def on_message(client, userdata, msg):
 
     Il payload viene decodificato da bytes a stringa, poi convertito
     in dizionario Python tramite json.loads().
-    Il dizionario viene poi passato a insert_probe_data() per salvarlo nel db.
+    Vengono chiamate in sequenza:
+        1. upsert_probe()      -> aggiorna l'anagrafica del sensore
+        2. insert_probe_data() -> inserisce i dati di transito del veicolo
     Il blocco try/except gestisce eventuali errori senza interrompere lo script.
     """
     try:
         payload = json.loads(msg.payload.decode())
         print(f"___ Ricevuto: {payload}")
-        insert_probe_data(userdata['conn'], payload)
+        # Prima aggiorna l'anagrafica della probe se necessario
+        upsert_probe(conn=userdata['conn'], data=payload)
+        # Poi inserisce i dati di transito del veicolo
+        insert_probe_data(conn=userdata['conn'], data=payload)
     except Exception as e:
         print(f"X Errore: {e}")
 
